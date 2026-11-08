@@ -329,6 +329,7 @@ class Fleet:
         with self.lock:
             if worker.get("vmState") == "destroyed":
                 worker.update(stopRequested=False, phase="stopped")
+                worker.pop("intent", None)
                 return
             worker["stopRequested"] = True
             if not self.verified_team or worker.get("intent") == "destroy" or worker.get("destroySent"):
@@ -468,7 +469,7 @@ class Fleet:
                         if run:
                             run["cancelled"] = True
         with self.lock:
-            if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values()) and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
+            if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values() if w.get("vmState") != "destroyed") and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
                 run["finishedAt"] = run["finishedAt"] or self.clock()
             self.save()
 

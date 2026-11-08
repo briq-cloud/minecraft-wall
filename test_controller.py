@@ -585,6 +585,13 @@ class FleetTests(unittest.TestCase):
         self.fleet.state['workers']['bq_worker'].update(vmState='destroyed', gameStopError='old unresolved exec stop', intent='stop')
         self.start_sync()
         self.assertEqual(self.fleet.state['run']['workers'], ['bq_fork'])
+        self.fleet.stop()
+        self.drain()
+        self.fleet.tick()
+        self.assertIsNotNone(self.fleet.state['run']['finishedAt'])
+        self.assertNotIn('intent', self.fleet.state['workers']['bq_worker'])
+        self.start_sync()
+        self.assertIsNone(self.fleet.state['run']['finishedAt'])
 
     def test_stale_frames_are_not_counted_running(self):
         self.start_sync()
