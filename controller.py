@@ -214,6 +214,7 @@ class Fleet:
                 w.pop("execState", None)
                 w.pop("gameStopSent", None)
                 w.pop("exitCode", None)
+                w.pop("warning", None)
             self.state["quota"].update(capacity=capacity, allowedConcurrency=capacity)
             self.state["run"] = run
             self.launching = True
@@ -284,6 +285,10 @@ class Fleet:
         self.refresh_quota()
         if not self.verified_team:
             return
+        # Rotate at most two exec-status checks per three-second monitor tick.
+        candidates = sorted((w for w in workers if w.get("execId") and w.get("execState") == "running"),
+                            key=lambda w: w.get("lastExecCheckedAt", 0))[:2]
+        check_ids = {w["id"] for w in candidates}
         for w in workers:
             if run and not run.get("finishedAt") and not run.get("deadlineStopRequested") and self.clock() >= run["deadline"]:
                 run["deadlineStopRequested"] = True
@@ -293,9 +298,11 @@ class Fleet:
                 w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
                 selected = run and w["id"] in run["workers"]
                 stopping = w.get("stopRequested") or (selected and run["cancelled"])
-                if w.get("execId") and b["state"] == "running" and not stopping:
+                if w["id"] in check_ids and b["state"] == "running" and not stopping:
+                    w["lastExecCheckedAt"] = self.clock()
                     e = self.api.call("GET", "/v1/briqs/" + w["id"] + "/execs/" + w["execId"])["exec"]
                     w.update(execState=e["state"], exitCode=e["exitCode"])
+                    w.pop("warning", None)
                     if e["state"] != "running":
                         w["phase"] = "finished" if e["state"] == "exited" and e["exitCode"] == 0 else "error" if e["state"] in {"lost", "timed_out"} or e["exitCode"] not in {None, 0} else "stopped"
                         stopping = True
@@ -350,7 +357,10 @@ class Fleet:
                     w["phase"] = "error"
             except Exception as exc:
                 with self.lock:
-                    w["error"] = str(exc) if isinstance(exc, RuntimeError) else "Worker observation failed"
+                    if isinstance(exc, APIRejected) and str(exc) == "API HTTP 429":
+                        w["warning"] = "API rate limited; status delayed"
+                    else:
+                        w["error"] = str(exc) if isinstance(exc, RuntimeError) else "Worker observation failed"
                     if w.get("intent"):
                         w["phase"] = "error"
                         if run:

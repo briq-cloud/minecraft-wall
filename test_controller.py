@@ -267,6 +267,40 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(self.api.rows['bq_worker']['state'], 'stopped')
 
+    def test_rate_limit_is_status_delay_not_game_failure(self):
+        self.start_sync()
+        self.fleet.tick()
+        original = self.api.call
+        def rate_limit(method, path, body=None):
+            if method == 'GET' and '/execs/' in path:
+                raise APIRejected('API HTTP 429')
+            return original(method, path, body)
+        self.api.call = rate_limit
+        self.fleet.tick()
+        self.assertEqual(self.fleet.snapshot()['summary']['errors'], 0)
+        self.assertIn('warning', self.fleet.state['workers']['bq_worker'])
+        self.api.call = original
+        self.fleet.tick()
+        self.assertNotIn('warning', self.fleet.state['workers']['bq_worker'])
+
+    def test_exec_checks_are_paced_and_rotate(self):
+        self.start_sync()
+        self.fleet.tick()
+        base = copy.deepcopy(self.fleet.state['workers']['bq_worker'])
+        for number in range(5):
+            identity = 'bq_extra' + str(number)
+            self.fleet.state['workers'][identity] = {**base, 'id': identity}
+            self.api.rows[identity] = {**self.api.rows['bq_worker'], 'id': identity}
+        seen = set()
+        for number in range(3):
+            self.fleet.clock = lambda n=number: 1001 + n
+            self.api.calls.clear()
+            self.fleet.tick()
+            checks = [path for method, path, _ in self.api.calls if method == 'GET' and '/execs/' in path]
+            self.assertLessEqual(len(checks), 2)
+            seen.update(path.split('/')[3] for path in checks)
+        self.assertEqual(len(seen), 6)
+
     def test_game_is_stopped_before_vm_snapshot(self):
         self.start_sync()
         self.fleet.tick()
