@@ -3,11 +3,14 @@ on:
   pull_request:
   push:
     branches: [main]
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   checks:
-    runs-on: ubicloud-standard-2-ubuntu-2604
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
