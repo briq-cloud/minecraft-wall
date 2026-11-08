@@ -7,13 +7,14 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-TERMINAL_VM = {"stopped", "sleeping", "error"}
+TERMINAL_VM = {"destroyed"}
 GAME_CMD = ["bash", "/work/minecraft-prototype/run.sh"]
 
 
@@ -53,6 +54,8 @@ class Fleet:
     def __init__(self, api, config, state_path, clock=time.time):
         self.api, self.config, self.path, self.clock = api, config, Path(state_path), clock
         self.lock = threading.RLock()
+        self.cleanup = ThreadPoolExecutor(max_workers=8, thread_name_prefix="destroy-worker")
+        self.destroy_jobs = {}
         self.launching = False
         self.start_lock = threading.Lock()
         self.preflighting = False
@@ -87,18 +90,18 @@ class Fleet:
         selected = set(active["workers"]) if active else set()
         reserved = active["requested"] if active else 0
         workers = list(self.state["workers"].values())
-        available = [w for w in workers if w["id"] not in selected and not w.get("stopRequested")
-                     and w.get("vmState") in {"running", "stopped", "sleeping"}]
-        live = sum(w.get("vmState") == "running" for w in available)
-        pending = max(0, reserved - len(selected)) + sum(
-            self.state["workers"][identity].get("phase") in {"queued", "starting"} and
-            self.state["workers"][identity].get("vmState") != "running" for identity in selected)
+        # Receipts are retained forever; only non-destroyed VMs consume fleet slots.
+        live_workers = sum(w.get("vmState") != "destroyed" for w in workers)
+        pending = max(0, reserved - len(selected))
+        pending_start = sum(self.state["workers"][identity].get("phase") in {"queued", "starting"}
+                            and self.state["workers"][identity].get("vmState") not in {"running", "destroyed"}
+                            for identity in selected)
         headroom = max(0, min(quota["remainingConcurrency"], int(
-            (quota["maxMemoryGb"] - quota["memoryGb"]) / self.config["workerMemoryGb"])) - pending)
-        forks = max(0, min(100 - len(workers) - max(0, reserved - len(selected)), int(
-            (quota["maxDiskGb"] - quota["diskGb"]) / self.config["workerDiskGb"]) - max(0, reserved - len(selected))))
-        additional = max(0, min(100 - reserved, live + headroom, len(available) + forks))
-        fresh = max(0, min(100 - reserved, headroom, forks))
+            (quota["maxMemoryGb"] - quota["memoryGb"]) / self.config["workerMemoryGb"])) - pending - pending_start)
+        forks = max(0, min(100 - live_workers - pending, int(
+            (quota["maxDiskGb"] - quota["diskGb"]) / self.config["workerDiskGb"]) - pending))
+        additional = fresh = max(0, min(100 - reserved, headroom, forks))
+        available = []
         if active and (active["cancelled"] or self.clock() >= active["deadline"]):
             additional = fresh = 0
         return additional, fresh, available
@@ -167,11 +170,13 @@ class Fleet:
             result = self.api.call("POST", "/v1/briqs/" + worker["id"] + "/" + action, body)
         except APIRejected:
             with self.lock:
-                worker.pop("intent", None)
+                if worker.get("intent") == action:
+                    worker.pop("intent", None)
                 self.save()
             raise
         with self.lock:
-            worker.pop("intent", None)
+            if worker.get("intent") == action:
+                worker.pop("intent", None)
             self.save()
         return result
 
@@ -197,7 +202,7 @@ class Fleet:
             active = old if old and not old.get("finishedAt") else None
             live_launch = active and self.launching and not active["cancelled"]
             if (self.state.get("forkIntent") and not live_launch) or any(
-                w.get("gameStopError") or (w.get("intent") and not (live_launch and w["intent"] == "start"))
+                w.get("vmState") != "destroyed" and (w.get("gameStopError") or (w.get("intent") and not (live_launch and w["intent"] == "start")))
                 for w in self.state["workers"].values()):
                 raise ValueError("Reconcile unresolved mutation intents in the receipt first")
             if active and (active["cancelled"] or self.clock() >= active["deadline"]):
@@ -215,6 +220,8 @@ class Fleet:
             if not self.budget_ready():
                 raise ValueError("Daily credit budget exhausted or quota stale")
             for w in list(self.state["workers"].values()):
+                if w.get("vmState") == "destroyed":
+                    continue
                 b = self.api.call("GET", "/v1/briqs/" + w["id"])["briq"]
                 with self.lock:
                     w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
@@ -228,7 +235,7 @@ class Fleet:
                 if generation != self.stop_generation or (active and self.clock() >= active["deadline"]):
                     raise ValueError("Launch cancelled by Stop all or deadline")
                 rows.sort(key=lambda w: w["vmState"] != "running")
-                selected = rows[:count] if mode == "cold" else []
+                selected = []
                 now = self.clock()
                 run = active or {"id": uuid.uuid4().hex, "requested": 0, "startedAt": now,
                        "deadline": now + duration, "cancelled": False, "launching": False,
@@ -300,12 +307,16 @@ class Fleet:
                     if run.get("pendingForkSources"):
                         run["pendingForkSources"].pop(0)
                     self.save()
+                    if run["cancelled"]:
+                        for b in result["briqs"]:
+                            self.queue_destroy(self.state["workers"][b["id"]])
         except Exception as exc:
             with self.lock:
                 if isinstance(exc, APIRejected):
                     self.state.pop("forkIntent", None)
                 self.state["errors"].append(str(exc) if isinstance(exc, RuntimeError) else "Launch failed")
                 run["cancelled"] = True
+                self.stop()
         finally:
             if not completed:
                 with self.lock:
@@ -313,17 +324,55 @@ class Fleet:
                     run["launching"] = False
                     self.save()
 
+    def queue_destroy(self, worker):
+        """Persist and dispatch one destroy; an unknown outcome is observed, never replayed."""
+        with self.lock:
+            if worker.get("vmState") == "destroyed":
+                worker.update(stopRequested=False, phase="stopped")
+                worker.pop("intent", None)
+                return
+            worker["stopRequested"] = True
+            if not self.verified_team or worker.get("intent") == "destroy" or worker.get("destroySent"):
+                return
+            job = self.destroy_jobs.get(worker["id"])
+            if job and not job.done():
+                return
+            worker.update(intent="destroy", destroySent=True, phase="stopping")
+            self.save()
+            self.destroy_jobs[worker["id"]] = self.cleanup.submit(self.destroy_worker, worker)
+
+    def destroy_worker(self, worker):
+        try:
+            result = self.api.call("DELETE", "/v1/briqs/" + worker["id"])
+            # DELETE can acknowledge asynchronous destruction; GET confirms terminal state.
+            with self.lock:
+                worker.pop("intent", None)
+                b = result.get("briq", {}) if isinstance(result, dict) else {}
+                if b.get("state") == "destroyed":
+                    worker.update(vmState="destroyed", phase="stopped", stopRequested=False,
+                                  cost=b.get("costCentsSoFar", worker.get("cost", 0)))
+        except APIRejected as exc:
+            with self.lock:
+                if str(exc) == "API HTTP 404":
+                    worker.update(vmState="destroyed", phase="stopped", stopRequested=False)
+                else:
+                    worker["destroySent"] = False
+                    worker["warning"] = str(exc)
+                worker.pop("intent", None)
+        except Exception:
+            with self.lock:
+                worker["error"] = "Destroy outcome unknown; awaiting GET confirmation"
+        finally:
+            self.save()
+
     def stop(self):
         with self.lock:
             self.stop_generation += 1
             run = self.state["run"]
             if run:
                 run["cancelled"] = True
-            # Stop all explicitly owned workers, including unused prepared workers.
             for w in self.state["workers"].values():
-                if not w.get("intent") and w.get("vmState") == "running":
-                    w["stopSent"] = False
-                w["stopRequested"] = True
+                self.queue_destroy(w)
             self.save()
 
     def tick(self):
@@ -337,16 +386,28 @@ class Fleet:
         if not self.verified_team:
             return
         # Rotate at most two exec-status checks per three-second monitor tick.
-        candidates = sorted((w for w in workers if w.get("execId") and w.get("execState") == "running"),
+        candidates = sorted((w for w in workers if w.get("execId") and w.get("execState") == "running"
+                             and w.get("vmState") == "running" and not w.get("stopRequested")),
                             key=lambda w: w.get("lastExecCheckedAt", 0))[:2]
         check_ids = {w["id"] for w in candidates}
         for w in workers:
+            if w.get("vmState") == "destroyed":
+                continue
             if run and not run.get("finishedAt") and not run.get("deadlineStopRequested") and self.clock() >= run["deadline"]:
                 run["deadlineStopRequested"] = True
                 self.stop()
             try:
                 b = self.api.call("GET", "/v1/briqs/" + w["id"])["briq"]
-                w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
+                with self.lock:
+                    if w.get("vmState") == "destroyed":
+                        continue
+                    w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
+                    if b["state"] == "destroyed":
+                        w.update(phase="stopped", stopRequested=False)
+                        w.pop("intent", None)
+                        if w.get("error", "").startswith("Destroy outcome unknown"):
+                            w.pop("error", None)
+                        continue
                 selected = run and w["id"] in run["workers"]
                 stopping = w.get("stopRequested") or (selected and run["cancelled"])
                 if w["id"] in check_ids and b["state"] == "running" and not stopping:
@@ -355,31 +416,10 @@ class Fleet:
                     w.update(execState=e["state"], exitCode=e["exitCode"])
                     w.pop("warning", None)
                     if e["state"] != "running":
-                        w["phase"] = "finished" if e["state"] == "exited" and e["exitCode"] == 0 else "error" if e["state"] in {"lost", "timed_out"} or e["exitCode"] not in {None, 0} else "stopped"
+                        w["gameResult"] = "finished" if e["state"] == "exited" and e["exitCode"] == 0 else "error" if e["state"] in {"lost", "timed_out"} or e["exitCode"] not in {None, 0} else "stopped"
                         stopping = True
                 if stopping:
-                    if b["state"] == "running" and not w.get("stopSent"):
-                        # Stop the game group before the VM snapshot can retain it.
-                        # An exec observation failure must never prevent the VM stop.
-                        if w.get("execId") and not w.get("gameStopSent"):
-                            w["gameStopSent"] = True
-                            self.save()
-                            try:
-                                self.api.call("DELETE", "/v1/briqs/" + w["id"] + "/execs/" + w["execId"])
-                            except Exception:
-                                w["gameStopError"] = "Game stop outcome requires reconciliation before reuse"
-                                w["error"] = w["gameStopError"]
-                        w["stopSent"] = True
-                        self.save()
-                        try:
-                            self.call_worker(w, "stop")
-                        except APIRejected:
-                            w["stopSent"] = False
-                            raise
-                    if b["state"] in TERMINAL_VM:
-                        w["stopRequested"] = False
-                        if w["phase"] not in {"finished", "error"}:
-                            w["phase"] = "stopped"
+                    self.queue_destroy(w)
                 elif selected and w["phase"] == "starting" and b["state"] == "running" and self.budget_ready():
                     # Adopt a recorded running game; never launch a duplicate.
                     active = [e for e in self.api.call("GET", "/v1/briqs/" + w["id"] + "/execs")["execs"]
@@ -391,33 +431,45 @@ class Fleet:
                         e = self.call_worker(w, "exec", {"cmd": GAME_CMD, "async": True, "timeoutMs": remaining})["exec"]
                     else:
                         continue
-                    w.update(execId=e["id"], execState=e["state"], phase="preparing")
+                    with self.lock:
+                        w.update(execId=e["id"], execState=e["state"])
+                        if not w.get("stopRequested") and w.get("vmState") != "destroyed":
+                            w["phase"] = "preparing"
                 if w.get("execState") == "running" and b["state"] == "running" and not stopping:
                     try:
                         with build_opener(NoRedirect).open("http://" + w["host"] + ":8090/health", timeout=2) as response:
                             health = json.loads(response.read(4096))
                         age = health.get("frameAgeSeconds")
                         fresh = isinstance(age, (int, float)) and 0 <= age < 10
-                        if health.get("error"):
-                            w.update(phase="error", error="Worker reported a game error", stopRequested=True)
-                        else:
-                            w["phase"] = "running" if health.get("gameLoaded") and health.get("javaAlive") and fresh else "preparing"
+                        with self.lock:
+                            if not w.get("stopRequested") and w.get("vmState") != "destroyed":
+                                if health.get("error"):
+                                    w.update(gameResult="error", error="Worker reported a game error")
+                                    self.queue_destroy(w)
+                                else:
+                                    w["phase"] = "running" if health.get("gameLoaded") and health.get("javaAlive") and fresh else "preparing"
                     except (OSError, ValueError):
-                        w["phase"] = "preparing"
-                if b["state"] == "error":
-                    w["phase"] = "error"
+                        with self.lock:
+                            if not w.get("stopRequested") and w.get("vmState") != "destroyed":
+                                w["phase"] = "preparing"
+                if b["state"] in {"stopped", "sleeping", "error"} and selected:
+                    self.queue_destroy(w)
             except Exception as exc:
                 with self.lock:
+                    if isinstance(exc, APIRejected) and str(exc) == "API HTTP 404" and w.get("stopRequested"):
+                        w.update(vmState="destroyed", phase="stopped", stopRequested=False)
+                        w.pop("intent", None)
+                        continue
                     if isinstance(exc, APIRejected) and str(exc) == "API HTTP 429":
                         w["warning"] = "API rate limited; status delayed"
                     else:
                         w["error"] = str(exc) if isinstance(exc, RuntimeError) else "Worker observation failed"
-                    if w.get("intent"):
+                    if w.get("intent") and w.get("vmState") != "destroyed":
                         w["phase"] = "error"
                         if run:
                             run["cancelled"] = True
         with self.lock:
-            if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values()) and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
+            if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values() if w.get("vmState") != "destroyed") and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
                 run["finishedAt"] = run["finishedAt"] or self.clock()
             self.save()
 
@@ -438,14 +490,14 @@ class Fleet:
                              capacity=reserved + additional, allowedConcurrency=reserved + additional)
         run = result["run"]
         selected = [result["workers"][i] for i in run["workers"]] if run else []
-        result["summary"] = {"running": sum(w["phase"] == "running" for w in selected),
+        result["summary"] = {"running": sum(w["phase"] == "running" and w.get("vmState") == "running" and not w.get("stopRequested") for w in selected),
                              "preparing": (max(0, run["requested"] - len(selected)) if run and not run["cancelled"] else 0) + sum(
                                  w["phase"] in {"queued", "starting", "preparing"} and not w.get("stopRequested")
                                  and not (run and run["cancelled"]) for w in selected),
                              "vmRunning": sum(w.get("vmState") == "running" for w in selected),
                              "started": sum(bool(w.get("execId")) for w in selected),
-                             "finished": sum(w["phase"] == "finished" for w in selected),
-                             "errors": sum(w["phase"] == "error" or bool(w.get("error")) for w in selected),
+                             "finished": sum(w.get("gameResult") == "finished" for w in selected),
+                             "errors": sum(w["phase"] == "error" or w.get("gameResult") == "error" or bool(w.get("error")) for w in selected),
                              "costCents": sum(max(0, w.get("cost", 0) - w.get("baseline", 0)) for w in selected),
                              "elapsed": max(0, int((run["finishedAt"] or self.clock()) - run["startedAt"])) if run else 0}
         # Neither API secrets nor arbitrary hosts go to the browser.

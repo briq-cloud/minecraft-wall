@@ -60,6 +60,8 @@ vm.runInContext(html.split('<script>')[1].split('</script>')[0],context);
   assert.equal(vm.runInContext("tiles.get('test').img.src",context),undefined,'stopped tile drops stale screen');
   assert.equal(vm.runInContext("tiles.get('test').message.textContent",context),'Stopped');
   assert.equal(vm.runInContext("tiles.get('test').icon.textContent",context),'■');
+  vm.runInContext("tile({id:'test',phase:'stopped',vmState:'destroyed'})",context);
+  assert.equal(vm.runInContext("tiles.get('test').message.textContent",context),'Sandbox removed');
   state.quota = {...state.quota,capacity:7};
   await vm.runInContext('refresh()',context);
   assert.equal(node('#count').max,'7');
