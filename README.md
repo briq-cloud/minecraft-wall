@@ -1,6 +1,6 @@
 # Minecraft wall
 
-Run real Minecraft Java clients in separate [briq](https://briq.cloud) VMs and watch their screens together. Choose 1–100 clients, start or stop the fleet, and track running games, elapsed time, errors, cost and remaining daily credits.
+Run real Minecraft Java clients in separate [briq](https://briq.cloud) VMs and watch their screens together. Choose 1–100 sandboxes, add to or stop the fleet, and track startup, playing games, errors, cost and remaining daily credits.
 
 Each client plays an independent built-in **demo world** with scripted keyboard movement. No Minecraft account is needed. This is a prototype, not multiplayer or an AI player.
 
@@ -49,11 +49,15 @@ briq stop "$TEMPLATE"
 python3 deploy.py --template "$TEMPLATE"
 ```
 
-Open the printed dashboard link and follow the controller's private URL. Choose **10** clients and click **Start fleet**. The first launch can take a few minutes. Tiles become running when a world and fresh capture are available.
+Open the printed dashboard link and follow the controller's private URL. Choose **10** sandboxes and click **Start fleet**. The first launch can take a few minutes. The counters distinguish running VMs, clients still starting/loading, and games ready to play.
+
+- **Cold start / reuse** restarts previously stopped sandboxes, creating template forks when needed.
+- **Fork disks** creates new sandboxes from a playing worker’s disk when available, otherwise the prepared template. Forks copy files, not Java process memory: Minecraft still boots. This is not an instant live-game clone.
+- **Add to fleet** adds the selected number while the current run continues, within available capacity. Added sandboxes share its original 15-minute deadline.
 
 **Stop all** stops workers and keeps results visible on the separate controller. Runs stop automatically after 15 minutes while the controller runs; game execs also have a bounded deadline.
 
-The slider follows available capacity, up to 100 sandboxes, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
+The slider follows available capacity for the selected launch mode, up to 100 sandboxes in the active fleet, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
 
 ## How it works
 
