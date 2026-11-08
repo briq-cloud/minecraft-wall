@@ -51,11 +51,11 @@ python3 deploy.py --template "$TEMPLATE"
 
 Open the printed dashboard link and follow the controller's private URL. Choose **10** sandboxes and click **Start fleet**. The first launch can take a few minutes. The counters distinguish running VMs, clients still starting/loading, and games ready to play.
 
-- **Cold start / reuse** restarts previously stopped sandboxes, creating template forks when needed.
+- **Cold start** creates fresh sandboxes from the prepared template.
 - **Fork disks** creates new sandboxes from a playing worker’s disk when available, otherwise the prepared template. Forks copy files, not Java process memory: Minecraft still boots. This is not an instant live-game clone.
 - **Add to fleet** adds the selected number while the current run continues, within available capacity. Added sandboxes share its original 15-minute deadline.
 
-**Stop all** stops workers and keeps results visible on the separate controller. Runs stop automatically after 15 minutes while the controller runs; game execs also have a bounded deadline.
+**Stop all** destroys worker VMs and disks in parallel, without saving memory snapshots, and keeps results visible on the separate controller. Runs stop automatically after 15 minutes while the controller runs; game execs also have a bounded deadline.
 
 The slider follows available capacity for the selected launch mode, up to 100 sandboxes in the active fleet, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
 
@@ -81,9 +81,11 @@ Workers use **small: 1 vCPU / 2 GB RAM**, with a 1 GB Java heap, 640×360 displa
 
 Cost is metered usage for the selected workers since this run started. It excludes the controller, template and previous usage. The total can update as API metering catches up. **Credits remaining today** is the lower of the account balance and remaining daily allowance. Amounts display in EUR or USD; USD uses the rate returned by briq’s pricing API. Billing and credit limits remain in EUR.
 
+Omitting `volume` creates a sandbox without a persistent data volume; `gb: 0` is invalid. Volume-free forks copy config only, so this prototype keeps a volume for prepared assets and saved worlds, then deletes it with the worker. The production API has no separate ephemeral or fast-stop flag.
+
 ## Cleanup and development
 
-Stop all keeps worker disks for reuse. To remove this installation and its disks, review the stack first, then destroy it:
+Workers are disposable and their disks are deleted when stopped. The prepared template and controller remain. To remove the entire installation, review the stack first, then destroy it:
 
 ```sh
 briq list --stack minecraft-wall
