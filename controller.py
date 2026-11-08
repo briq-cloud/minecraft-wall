@@ -81,6 +81,28 @@ class Fleet:
         self.state["quota"] = {"capacity": 0, "error": "Quota not yet verified", "fetchedAt": None}
         self.save()
 
+    def capacities(self, quota):
+        run = self.state["run"]
+        active = run if run and not run.get("finishedAt") else None
+        selected = set(active["workers"]) if active else set()
+        reserved = active["requested"] if active else 0
+        workers = list(self.state["workers"].values())
+        available = [w for w in workers if w["id"] not in selected and not w.get("stopRequested")
+                     and w.get("vmState") in {"running", "stopped", "sleeping"}]
+        live = sum(w.get("vmState") == "running" for w in available)
+        pending = max(0, reserved - len(selected)) + sum(
+            self.state["workers"][identity].get("phase") in {"queued", "starting"} and
+            self.state["workers"][identity].get("vmState") != "running" for identity in selected)
+        headroom = max(0, min(quota["remainingConcurrency"], int(
+            (quota["maxMemoryGb"] - quota["memoryGb"]) / self.config["workerMemoryGb"])) - pending)
+        forks = max(0, min(100 - len(workers) - max(0, reserved - len(selected)), int(
+            (quota["maxDiskGb"] - quota["diskGb"]) / self.config["workerDiskGb"]) - max(0, reserved - len(selected))))
+        additional = max(0, min(100 - reserved, live + headroom, len(available) + forks))
+        fresh = max(0, min(100 - reserved, headroom, forks))
+        if active and (active["cancelled"] or self.clock() >= active["deadline"]):
+            additional = fresh = 0
+        return additional, fresh, available
+
     def refresh_quota(self, force=False):
         """Refresh real quota at most every ten seconds; never trust persisted identity."""
         with self.quota_lock:
@@ -97,16 +119,16 @@ class Fleet:
                 money = {name: quota[name] for name in ("creditBalanceCents", "remainingTodayCents", "spentTodayCents")}
                 if any(type(value) not in (int, float) or not math.isfinite(value) for value in money.values()):
                     raise ValueError("Invalid credit quota")
-                workers = list(self.state["workers"].values())
-                headroom = min(quota["remainingConcurrency"], int((quota["maxMemoryGb"] - quota["memoryGb"]) / self.config["workerMemoryGb"]))
-                reusable = sum(w.get("vmState") == "running" for w in workers)
-                disk_forks = max(0, int((quota["maxDiskGb"] - quota["diskGb"]) / self.config["workerDiskGb"]))
-                capacity = max(0, min(reusable + headroom, len(workers) + disk_forks))
+                with self.lock:
+                    additional, fresh, _ = self.capacities(quota)
+                    run = self.state["run"]
+                    reserved = run["requested"] if run and not run.get("finishedAt") else 0
+                    capacity = reserved + additional
                 budget = max(0, min(money["creditBalanceCents"], money["remainingTodayCents"]))
                 with self.lock:
                     self.raw_quota = quota
                     self.state["quota"] = {**money, "budgetCents": budget, "capacity": capacity,
-                        "allowedConcurrency": capacity, "remainingConcurrency": quota["remainingConcurrency"], "fetchedAt": self.clock()}
+                        "allowedConcurrency": capacity, "additionalCapacity": additional, "forkCapacity": fresh, "remainingConcurrency": quota["remainingConcurrency"], "fetchedAt": self.clock()}
                     run = self.state["run"]
                     if budget <= 0 and run and not run.get("finishedAt") and not run["cancelled"]:
                         run["stopReason"] = "Daily credit budget exhausted"
@@ -117,7 +139,7 @@ class Fleet:
                 with self.lock:
                     self.raw_quota = None
                     previous = self.state.get("quota", {})
-                    self.state["quota"] = {**previous, "capacity": 0, "allowedConcurrency": 0,
+                    self.state["quota"] = {**previous, "capacity": 0, "allowedConcurrency": 0, "additionalCapacity": 0, "forkCapacity": 0,
                         "error": "API credential team mismatch" if not self.verified_team and isinstance(exc, ValueError) else "Quota unavailable"}
                     self.save()
                 return None
@@ -153,25 +175,37 @@ class Fleet:
             self.save()
         return result
 
-    def start(self, count, duration=900):
+    def start(self, count, duration=900, mode="cold", add=False):
         if not self.start_lock.acquire(blocking=False):
             raise ValueError("Launch preflight already in progress")
         try:
-            return self._start(count, duration)
+            return self._start(count, duration, mode, add)
         finally:
             self.start_lock.release()
 
-    def _start(self, count, duration=900):
+    def _start(self, count, duration=900, mode="cold", add=False):
         if type(count) is not int or not 1 <= count <= 100:
             raise ValueError("Count must be 1–100")
         if type(duration) is not int or not 60 <= duration <= 1800:
             raise ValueError("Duration must be 60–1800 seconds")
+        if not isinstance(mode, str) or mode not in {"cold", "fork"}:
+            raise ValueError("Mode must be cold or fork")
+        if type(add) is not bool:
+            raise ValueError("Add must be a boolean")
         with self.lock:
             old = self.state["run"]
-            if self.state.get("forkIntent") or any(w.get("intent") or w.get("gameStopError") for w in self.state["workers"].values()):
+            active = old if old and not old.get("finishedAt") else None
+            live_launch = active and self.launching and not active["cancelled"]
+            if (self.state.get("forkIntent") and not live_launch) or any(
+                w.get("gameStopError") or (w.get("intent") and not (live_launch and w["intent"] == "start"))
+                for w in self.state["workers"].values()):
                 raise ValueError("Reconcile unresolved mutation intents in the receipt first")
-            if self.launching or self.preflighting or (old and not old.get("finishedAt")):
+            if active and (active["cancelled"] or self.clock() >= active["deadline"]):
                 raise ValueError("Stop and finish the current run first")
+            if add and not active:
+                raise ValueError("No active run to add to")
+            if active and active["requested"] + count > 100:
+                raise ValueError("Fleet cannot exceed 100 workers")
             self.preflighting = True
             generation = self.stop_generation
         try:
@@ -180,75 +214,91 @@ class Fleet:
                 raise ValueError(self.state["quota"].get("error", "Quota unavailable"))
             if not self.budget_ready():
                 raise ValueError("Daily credit budget exhausted or quota stale")
-            rows = []
-            for w in self.state["workers"].values():
+            for w in list(self.state["workers"].values()):
                 b = self.api.call("GET", "/v1/briqs/" + w["id"])["briq"]
-                w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
-                rows.append(w)
-            reusable_live = sum(w["vmState"] == "running" for w in rows)
-            headroom = quota["remainingConcurrency"]
-            if "maxMemoryGb" not in quota or "maxDiskGb" not in quota:
-                raise ValueError("API must report memory and disk quota")
-            headroom = min(headroom, int((quota["maxMemoryGb"] - quota["memoryGb"]) / self.config["workerMemoryGb"]))
-            capacity = reusable_live + headroom
-            forks = max(0, count - len(rows))
-            if forks * self.config["workerDiskGb"] > quota["maxDiskGb"] - quota["diskGb"]:
-                raise ValueError("Requested forks exceed remaining disk quota")
-            if count > capacity:
-                raise ValueError(f"Quota permits {capacity} workers now; requested {count}")
+                with self.lock:
+                    w.update(vmState=b["state"], host=b["internalHost"], cost=b["costCentsSoFar"])
+            with self.lock:
+                if active and (self.state["run"] is not active or active.get("finishedAt")):
+                    raise ValueError("Current run finished during launch preflight")
+                additional, fresh, rows = self.capacities(quota)
+                capacity = fresh if mode == "fork" else additional
+                if count > capacity:
+                    raise ValueError(f"Quota permits {capacity} additional workers now (memory, disk and fleet limit); requested {count}")
+                if generation != self.stop_generation or (active and self.clock() >= active["deadline"]):
+                    raise ValueError("Launch cancelled by Stop all or deadline")
+                rows.sort(key=lambda w: w["vmState"] != "running")
+                selected = rows[:count] if mode == "cold" else []
+                now = self.clock()
+                run = active or {"id": uuid.uuid4().hex, "requested": 0, "startedAt": now,
+                       "deadline": now + duration, "cancelled": False, "launching": False,
+                       "finishedAt": None, "workers": [], "batches": []}
+                source = next((w["id"] for w in self.state["workers"].values()
+                               if mode == "fork" and w.get("phase") == "running" and w.get("vmState") == "running"
+                               and not w.get("stopRequested")), self.config["templateId"])
+                run.setdefault("pendingForkSources", []).extend([source] * (count - len(selected)))
+                run.setdefault("batches", []).append({"count": count, "mode": mode, "addedAt": now, "sourceId": source})
+                run["requested"] += count
+                run["workers"].extend(w["id"] for w in selected)
+                for w in selected:
+                    w.update(phase="queued", baseline=w["cost"], error=None, stopSent=False, stopRequested=False)
+                    for key in ("execId", "execState", "gameStopSent", "exitCode", "warning"):
+                        w.pop(key, None)
+                self.state["run"] = run
+                spawn = not self.launching
+                self.launching = True
+                run["launching"] = True
+                self.save()
         finally:
             with self.lock:
                 self.preflighting = False
-        with self.lock:
-            if generation != self.stop_generation:
-                raise ValueError("Launch cancelled by Stop all")
-            rows.sort(key=lambda w: w["vmState"] != "running")
-            selected = rows[:count]
-            now = self.clock()
-            run = {"id": uuid.uuid4().hex, "requested": count, "startedAt": now,
-                   "deadline": now + duration, "cancelled": False, "launching": True,
-                   "finishedAt": None, "workers": [w["id"] for w in selected]}
-            for w in selected:
-                w.update(phase="queued", baseline=w["cost"], error=None, stopSent=False, stopRequested=False)
-                w.pop("execId", None)
-                w.pop("execState", None)
-                w.pop("gameStopSent", None)
-                w.pop("exitCode", None)
-                w.pop("warning", None)
-            self.state["quota"].update(capacity=capacity, allowedConcurrency=capacity)
-            self.state["run"] = run
-            self.launching = True
-            self.save()
-        self.launch_thread = threading.Thread(target=self.launch, args=(run,), daemon=True)
-        self.launch_thread.start()
+        if spawn:
+            self.launch_thread = threading.Thread(target=self.launch, args=(run,), daemon=True)
+            self.launch_thread.start()
 
     def launch(self, run):
+        completed = False
         try:
-            for identity in list(run["workers"]):
-                if run["cancelled"]:
-                    break
-                if not self.budget_ready():
-                    raise RuntimeError("Credit quota unavailable or exhausted during launch")
-                w = self.state["workers"][identity]
-                if w["vmState"] in {"stopped", "sleeping"}:
-                    self.call_worker(w, "start")
-                w["phase"] = "starting"
-            while len(run["workers"]) < run["requested"] and not run["cancelled"]:
-                if not self.budget_ready():
-                    raise RuntimeError("Credit quota unavailable or exhausted during launch")
+            while True:
+                with self.lock:
+                    if run["cancelled"] or self.clock() >= run["deadline"]:
+                        break
+                    if not self.budget_ready():
+                        raise RuntimeError("Credit quota unavailable or exhausted during launch")
+                    queued = next((self.state["workers"][identity] for identity in run["workers"]
+                                   if self.state["workers"][identity]["phase"] == "queued"), None)
+                    if not queued and len(run["workers"]) >= run["requested"]:
+                        # Publish completion under the same lock used by additive starts.
+                        completed = True
+                        self.launching = False
+                        run["launching"] = False
+                        self.save()
+                        return
+                if queued:
+                    if queued["vmState"] in {"stopped", "sleeping"}:
+                        self.call_worker(queued, "start")
+                    with self.lock:
+                        queued["phase"] = "starting"
+                    continue
                 name = "mc-" + run["id"][:8] + "-" + str(len(run["workers"]) + 1)
                 with self.lock:
-                    self.state["forkIntent"] = {"name": name, "runId": run["id"]}
+                    if run["cancelled"]:
+                        break
+                    source = run.get("pendingForkSources", [self.config["templateId"]])[0]
+                    self.state["forkIntent"] = {"name": name, "runId": run["id"], "sourceId": source, "copies": "disk"}
                     self.save()
-                result = self.api.call("POST", "/v1/briqs/" + self.config["templateId"] + "/fork",
+                result = self.api.call("POST", "/v1/briqs/" + source + "/fork",
                                        {"name": name, "stack": self.config["stack"], "sleep": "30m", "wait": False})
                 with self.lock:
                     for b in result["briqs"]:
                         w = {"id": b["id"], "name": b["name"], "phase": "starting", "baseline": 0,
-                             "cost": b["costCentsSoFar"], "host": b["internalHost"], "vmState": b["state"], "stopSent": False}
+                             "cost": b["costCentsSoFar"], "host": b["internalHost"], "vmState": b["state"],
+                             "stopSent": False, "stopRequested": run["cancelled"]}
                         self.state["workers"][w["id"]] = w
                         run["workers"].append(w["id"])
                     self.state.pop("forkIntent", None)
+                    if run.get("pendingForkSources"):
+                        run["pendingForkSources"].pop(0)
                     self.save()
         except Exception as exc:
             with self.lock:
@@ -257,10 +307,11 @@ class Fleet:
                 self.state["errors"].append(str(exc) if isinstance(exc, RuntimeError) else "Launch failed")
                 run["cancelled"] = True
         finally:
-            with self.lock:
-                self.launching = False
-                run["launching"] = False
-                self.save()
+            if not completed:
+                with self.lock:
+                    self.launching = False
+                    run["launching"] = False
+                    self.save()
 
     def stop(self):
         with self.lock:
@@ -366,7 +417,7 @@ class Fleet:
                         if run:
                             run["cancelled"] = True
         with self.lock:
-            if run and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values()) and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
+            if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values()) and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
                 run["finishedAt"] = run["finishedAt"] or self.clock()
             self.save()
 
@@ -378,9 +429,20 @@ class Fleet:
         quota["ageSeconds"] = max(0, self.clock() - fetched) if fetched is not None else None
         quota["fresh"] = (not quota.get("error") and fetched is not None and 0 <= self.clock() - fetched <= 30)
         quota["canStart"] = self.budget_ready()
+        with self.lock:
+            if self.raw_quota and quota["canStart"]:
+                additional, fresh, _ = self.capacities(self.raw_quota)
+                current = self.state["run"]
+                reserved = current["requested"] if current and not current.get("finishedAt") else 0
+                quota.update(additionalCapacity=additional, forkCapacity=fresh,
+                             capacity=reserved + additional, allowedConcurrency=reserved + additional)
         run = result["run"]
         selected = [result["workers"][i] for i in run["workers"]] if run else []
         result["summary"] = {"running": sum(w["phase"] == "running" for w in selected),
+                             "preparing": (max(0, run["requested"] - len(selected)) if run and not run["cancelled"] else 0) + sum(
+                                 w["phase"] in {"queued", "starting", "preparing"} and not w.get("stopRequested")
+                                 and not (run and run["cancelled"]) for w in selected),
+                             "vmRunning": sum(w.get("vmState") == "running" for w in selected),
                              "started": sum(bool(w.get("execId")) for w in selected),
                              "finished": sum(w["phase"] == "finished" for w in selected),
                              "errors": sum(w["phase"] == "error" or bool(w.get("error")) for w in selected),
@@ -440,7 +502,7 @@ def make_handler(fleet):
                 if not isinstance(body, dict):
                     raise ValueError("JSON object required")
                 if self.path == "/api/start":
-                    fleet.start(body.get("count"), body.get("duration", 900))
+                    fleet.start(body.get("count"), body.get("duration", 900), body.get("mode", "cold"), body.get("add", False))
                 elif self.path == "/api/stop":
                     fleet.stop()
                 else:

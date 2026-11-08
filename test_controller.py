@@ -28,7 +28,8 @@ class FakeAPI:
             self.fork_entered.set()
             if self.fork_release:
                 self.fork_release.wait(2)
-            row = {**self.rows["bq_worker"], "id": "bq_fork", "name": body["name"], "state": "creating", "costCentsSoFar": 0}
+            identity = "bq_fork" if "bq_fork" not in self.rows else "bq_fork" + str(len(self.rows))
+            row = {**self.rows["bq_worker"], "id": identity, "name": body["name"], "state": "creating", "costCentsSoFar": 0}
             self.rows[row["id"]] = row
             return {"briqs": [copy.deepcopy(row)]}
         parts = path.split('/')
@@ -42,6 +43,9 @@ class FakeAPI:
         if method == "DELETE" and '/execs/' in path:
             self.exec.update(state='stopped', exitCode=None)
             return {"exec": copy.deepcopy(self.exec)}
+        if method == "POST" and path.endswith('/start'):
+            row['state'] = 'starting'
+            return {"briq": copy.deepcopy(row)}
         if method == "POST" and path.endswith('/stop'):
             row['state'] = 'stopped'
             return {"briq": copy.deepcopy(row)}
@@ -63,6 +67,153 @@ class FleetTests(unittest.TestCase):
         with patch('controller.threading.Thread'):
             self.fleet.start(count)
         self.fleet.launch(self.fleet.state['run'])
+
+    def test_add_preserves_run_deadline_game_and_cost_baseline(self):
+        self.start_sync()
+        self.fleet.tick()
+        original = copy.deepcopy(self.fleet.state['run'])
+        self.api.rows['bq_worker']['costCentsSoFar'] = 12
+        self.fleet.clock = lambda: 1100
+        with patch('controller.threading.Thread'):
+            self.fleet.start(1, duration=1800, mode='cold', add=True)
+        self.fleet.launch(self.fleet.state['run'])
+        run = self.fleet.state['run']
+        self.assertEqual(run['id'], original['id'])
+        self.assertEqual(run['deadline'], original['deadline'])
+        self.assertEqual(run['requested'], 2)
+        self.assertEqual(self.fleet.state['workers']['bq_worker']['execId'], 'ex_game')
+        self.assertEqual(self.fleet.state['workers']['bq_worker']['baseline'], 10)
+        self.assertEqual(self.fleet.snapshot()['summary']['costCents'], 2)
+        self.assertEqual(self.fleet.snapshot()['summary']['preparing'], 2)
+
+    def test_fork_mode_always_creates_fresh_workers_from_ready_worker(self):
+        self.start_sync()
+        self.fleet.state['workers']['bq_worker']['phase'] = 'running'
+        with patch('controller.threading.Thread'):
+            self.fleet.start(1, mode='fork')
+        self.fleet.launch(self.fleet.state['run'])
+        forks = [path for method, path, _ in self.api.calls if path.endswith('/fork')]
+        self.assertEqual(forks, ['/v1/briqs/bq_worker/fork'])
+        self.assertEqual(self.fleet.state['run']['batches'][-1]['sourceId'], 'bq_worker')
+        self.assertEqual(self.fleet.state['workers']['bq_fork']['baseline'], 0)
+
+    def test_fork_without_game_ready_source_uses_template_even_with_idle_worker(self):
+        with patch('controller.threading.Thread'):
+            self.fleet.start(1, mode='fork')
+        self.fleet.launch(self.fleet.state['run'])
+        self.assertEqual(self.fleet.state['run']['workers'], ['bq_fork'])
+        self.assertTrue(any(path == '/v1/briqs/bq_template/fork' for _, path, _ in self.api.calls))
+
+    def test_cold_mode_reuses_stopped_worker(self):
+        self.api.rows['bq_worker']['state'] = 'stopped'
+        self.start_sync()
+        self.assertTrue(any(path.endswith('/start') for _, path, _ in self.api.calls))
+        self.assertFalse(any(path.endswith('/fork') for _, path, _ in self.api.calls))
+
+    def test_add_during_inflight_fork_reserves_and_receipts_all_workers(self):
+        self.api.fork_release = threading.Event()
+        self.fleet.start(2)
+        self.assertTrue(self.api.fork_entered.wait(1))
+        self.fleet.start(1, mode='fork', add=True)
+        self.assertEqual(self.fleet.snapshot()['summary']['preparing'], 3)
+        self.assertEqual(self.fleet.state['run']['requested'], 3)
+        self.api.fork_release.set()
+        self.fleet.launch_thread.join(2)
+        self.assertFalse(self.fleet.launching)
+        self.assertEqual(len(self.fleet.state['run']['workers']), 3)
+        self.assertNotIn('forkIntent', self.fleet.state)
+
+    def test_stop_during_add_preflight_cancels_before_mutation(self):
+        self.start_sync()
+        original = self.api.call
+        def stop_on_read(method, path, body=None):
+            result = original(method, path, body)
+            if path == '/v1/briqs/bq_worker' and method == 'GET':
+                self.fleet.stop()
+            return result
+        self.api.call = stop_on_read
+        with self.assertRaisesRegex(ValueError, 'cancelled|Quota'):
+            self.fleet.start(1, add=True)
+        self.assertEqual(self.fleet.state['run']['requested'], 1)
+        self.assertFalse(any(path.endswith('/fork') for _, path, _ in self.api.calls))
+
+    def test_stop_during_add_fork_captures_late_worker(self):
+        self.start_sync()
+        self.api.fork_release = threading.Event()
+        self.fleet.start(1, mode='fork', add=True)
+        self.assertTrue(self.api.fork_entered.wait(1))
+        intent = json.loads(self.path.read_text())['forkIntent']
+        self.assertEqual(intent['sourceId'], 'bq_template')
+        self.assertEqual(intent['copies'], 'disk')
+        self.fleet.stop()
+        self.api.fork_release.set()
+        self.fleet.launch_thread.join(2)
+        self.assertTrue(self.fleet.state['workers']['bq_fork']['stopRequested'])
+        self.api.rows['bq_fork']['state'] = 'running'
+        self.fleet.tick()
+        self.assertEqual(self.api.rows['bq_fork']['state'], 'stopped')
+
+    def test_additional_quota_excludes_active_workers_and_requires_fork_disk(self):
+        self.start_sync()
+        self.api.quota.update(remainingConcurrency=0)
+        self.fleet.refresh_quota(force=True)
+        quota = self.fleet.snapshot()['quota']
+        self.assertEqual(quota['additionalCapacity'], 0)
+        self.assertEqual(quota['forkCapacity'], 0)
+        self.assertEqual(quota['capacity'], 1)
+        with self.assertRaisesRegex(ValueError, 'Quota'):
+            self.fleet.start(1)
+        self.api.quota.update(remainingConcurrency=9, maxDiskGb=16)
+        with self.assertRaisesRegex(ValueError, 'disk'):
+            self.fleet.start(1, mode='fork')
+
+    def test_fleet_and_owned_disk_caps_are_global(self):
+        self.start_sync()
+        with self.assertRaisesRegex(ValueError, '100'):
+            self.fleet.start(100)
+        for number in range(99):
+            identity = 'bq_extra' + str(number)
+            self.fleet.state['workers'][identity] = {'id': identity, 'phase': 'stopped', 'vmState': 'stopped'}
+            self.api.rows[identity] = {**self.api.rows['bq_worker'], 'id': identity, 'state': 'stopped'}
+        with self.assertRaisesRegex(ValueError, 'Quota'):
+            self.fleet.start(1, mode='fork')
+
+    def test_summary_distinguishes_vm_ready_game_ready_and_pending_forks(self):
+        with patch('controller.threading.Thread'):
+            self.fleet.start(3)
+        summary = self.fleet.snapshot()['summary']
+        self.assertEqual(summary['vmRunning'], 1)
+        self.assertEqual(summary['running'], 0)
+        self.assertEqual(summary['preparing'], 3)
+        self.fleet.state['workers']['bq_worker']['phase'] = 'running'
+        summary = self.fleet.snapshot()['summary']
+        self.assertEqual(summary['running'], 1)
+        self.assertEqual(summary['preparing'], 2)
+        self.fleet.stop()
+        self.assertEqual(self.fleet.snapshot()['summary']['preparing'], 0)
+
+    def test_finished_run_during_add_preflight_is_not_revived(self):
+        self.start_sync()
+        original = self.api.call
+        def finish_on_read(method, path, body=None):
+            result = original(method, path, body)
+            if path == '/v1/briqs/bq_worker' and method == 'GET':
+                self.fleet.state['run']['finishedAt'] = 1000
+            return result
+        self.api.call = finish_on_read
+        with self.assertRaisesRegex(ValueError, 'finished during'):
+            self.fleet.start(1, add=True)
+        self.assertEqual(self.fleet.state['run']['requested'], 1)
+        self.assertFalse(any(path.endswith('/fork') for _, path, _ in self.api.calls))
+
+    def test_snapshot_immediately_reserves_pending_launch_capacity(self):
+        self.api.quota['remainingConcurrency'] = 3
+        with patch('controller.threading.Thread'):
+            self.fleet.start(3)
+        quota = self.fleet.snapshot()['quota']
+        self.assertEqual(quota['additionalCapacity'], 1)
+        self.assertEqual(quota['forkCapacity'], 1)
+        self.assertEqual(quota['capacity'], 4)
 
     def test_zero_daily_budget_blocks_start_before_any_worker_read(self):
         self.api.quota['remainingTodayCents'] = 0
