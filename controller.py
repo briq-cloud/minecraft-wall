@@ -168,7 +168,7 @@ class Fleet:
             raise ValueError("Duration must be 60–1800 seconds")
         with self.lock:
             old = self.state["run"]
-            if self.state.get("forkIntent") or any(w.get("intent") for w in self.state["workers"].values()):
+            if self.state.get("forkIntent") or any(w.get("intent") or w.get("gameStopError") for w in self.state["workers"].values()):
                 raise ValueError("Reconcile unresolved mutation intents in the receipt first")
             if self.launching or self.preflighting or (old and not old.get("finishedAt")):
                 raise ValueError("Stop and finish the current run first")
@@ -212,6 +212,8 @@ class Fleet:
                 w.update(phase="queued", baseline=w["cost"], error=None, stopSent=False, stopRequested=False)
                 w.pop("execId", None)
                 w.pop("execState", None)
+                w.pop("gameStopSent", None)
+                w.pop("exitCode", None)
             self.state["quota"].update(capacity=capacity, allowedConcurrency=capacity)
             self.state["run"] = run
             self.launching = True
@@ -299,6 +301,16 @@ class Fleet:
                         stopping = True
                 if stopping:
                     if b["state"] == "running" and not w.get("stopSent"):
+                        # Stop the game group before the VM snapshot can retain it.
+                        # An exec observation failure must never prevent the VM stop.
+                        if w.get("execId") and not w.get("gameStopSent"):
+                            w["gameStopSent"] = True
+                            self.save()
+                            try:
+                                self.api.call("DELETE", "/v1/briqs/" + w["id"] + "/execs/" + w["execId"])
+                            except Exception:
+                                w["gameStopError"] = "Game stop outcome requires reconciliation before reuse"
+                                w["error"] = w["gameStopError"]
                         w["stopSent"] = True
                         self.save()
                         try:

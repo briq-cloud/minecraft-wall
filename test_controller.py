@@ -39,6 +39,9 @@ class FakeAPI:
             return {"execs": [copy.deepcopy(self.exec)]}
         if method == "GET" and '/execs/' in path:
             return {"exec": copy.deepcopy(self.exec)}
+        if method == "DELETE" and '/execs/' in path:
+            self.exec.update(state='stopped', exitCode=None)
+            return {"exec": copy.deepcopy(self.exec)}
         if method == "POST" and path.endswith('/stop'):
             row['state'] = 'stopped'
             return {"briq": copy.deepcopy(row)}
@@ -263,6 +266,16 @@ class FleetTests(unittest.TestCase):
         self.fleet.tick()
         self.assertEqual(len(attempts), 2)
         self.assertEqual(self.api.rows['bq_worker']['state'], 'stopped')
+
+    def test_game_is_stopped_before_vm_snapshot(self):
+        self.start_sync()
+        self.fleet.tick()
+        self.fleet.stop()
+        self.fleet.tick()
+        actions = [(method, path) for method, path, _ in self.api.calls]
+        game_stop = actions.index(('DELETE', '/v1/briqs/bq_worker/execs/ex_game'))
+        vm_stop = actions.index(('POST', '/v1/briqs/bq_worker/stop'))
+        self.assertLess(game_stop, vm_stop)
 
     def test_stale_frames_are_not_counted_running(self):
         self.start_sync()
