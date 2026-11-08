@@ -53,7 +53,7 @@ Open the printed dashboard link and follow the controller's private URL. Choose 
 
 **Stop all** stops workers and keeps results visible on the separate controller. Runs stop automatically after 15 minutes while the controller runs; game execs also have a bounded deadline.
 
-The slider goes to 100; actual capacity depends on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
+The slider follows available capacity, up to 100 sandboxes, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
 
 ## How it works
 
@@ -75,7 +75,7 @@ controller: start / stop / quota / billing ← browser wall ← frames
 
 Workers use **small: 1 vCPU / 2 GB RAM**, with a 1 GB Java heap, 640×360 display, two-chunk render distance and a 10 FPS target. Ten real clients have been exercised at this size. A 512 MB VM failed with a kernel out-of-memory kill even with a 256 MB heap, 320×240 and a 5 FPS target. Performance at 100 clients has not been validated.
 
-Cost is metered usage for the selected workers since this run started. It excludes the controller, template and previous usage. The total can update as API metering catches up. **Credits remaining today** is the lower of the account balance and remaining daily allowance.
+Cost is metered usage for the selected workers since this run started. It excludes the controller, template and previous usage. The total can update as API metering catches up. **Credits remaining today** is the lower of the account balance and remaining daily allowance. Amounts display in EUR or USD; USD uses the rate returned by briq’s pricing API. Billing and credit limits remain in EUR.
 
 ## Cleanup and development
 
