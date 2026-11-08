@@ -205,6 +205,11 @@ class FleetTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(response.status, 202)
             response.read()
+            # briq's edge overwrites forwarding headers and sends an internal Host.
+            connection.request('POST', '/api/stop', '{}', {'Origin': 'https://wall.example', 'X-Forwarded-Host': 'wall.example', 'X-Forwarded-Proto': 'https', 'Content-Type': 'application/json', 'X-Minecraft-Control': '1'})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 202)
+            response.read()
             connection.close()
         finally:
             server.shutdown()

@@ -406,7 +406,8 @@ def make_handler(fleet):
             origin = urlsplit(self.headers.get("Origin", ""))
             if (self.headers.get("X-Minecraft-Control") != "1" or
                 self.headers.get("Content-Type") != "application/json" or
-                origin.scheme not in {"http", "https"} or origin.netloc != self.headers.get("Host") or
+                origin.scheme != self.headers.get("X-Forwarded-Proto", "http") or
+                origin.netloc != self.headers.get("X-Forwarded-Host", self.headers.get("Host")) or
                 self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin"):
                 return self.reply(403, {"error": "Same-origin JSON control required"})
             try:
