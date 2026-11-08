@@ -1,0 +1,27 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const path = require('node:path');
+const nodes = new Map();
+const node = key => { if (!nodes.has(key)) nodes.set(key, {value:'10',disabled:false,textContent:''}); return nodes.get(key); };
+let state = {workers:{},run:null,errors:[],summary:{running:0,finished:0,errors:0,started:0,costCents:0,elapsed:0},quota:{capacity:100,canStart:false,fresh:true,budgetCents:0,creditBalanceCents:100,remainingTodayCents:0,spentTodayCents:100,ageSeconds:0}};
+const context = vm.createContext({document:{querySelector:node},Date,AbortSignal,setTimeout:()=>{},fetch:async()=>({ok:true,json:async()=>state})});
+const html = fs.readFileSync(path.join(__dirname,'controller.html'),'utf8');
+assert.match(html,/Credits remaining today/);
+assert.match(html,/daily allowance left and the team’s balance/);
+vm.runInContext(html.split('<script>')[1].split('</script>')[0],context);
+(async()=>{
+  await vm.runInContext('refresh()',context);
+  assert.equal(node('#start').disabled,true,'zero budget disables launch');
+  assert.equal(node('#stop').disabled,false,'stop remains available at zero');
+  assert.equal(node('#credits').textContent,'0.000');
+  state.quota = {...state.quota,budgetCents:25,remainingTodayCents:25,canStart:true};
+  await vm.runInContext('refresh()',context);
+  assert.equal(node('#start').disabled,false,'fresh positive budget allows launch');
+  state.quota = {...state.quota,fresh:false,canStart:false};
+  await vm.runInContext('refresh()',context);
+  assert.equal(node('#start').disabled,true,'stale quota disables launch');
+  assert.equal(node('#credits').textContent,'Unknown');
+  assert.equal(node('#stop').disabled,false,'stop remains available with stale quota');
+  console.log('Controller UI budget checks passed');
+})().catch(error=>{console.error(error);process.exitCode=1});

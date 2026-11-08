@@ -1,0 +1,6 @@
+.minecraft-wall/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.mp4
