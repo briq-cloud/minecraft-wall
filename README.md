@@ -1,6 +1,6 @@
 # Minecraft wall
 
-Run real Minecraft Java clients in separate [briq](https://briq.cloud) VMs and watch their screens together. Choose 1–100 sandboxes, add to or stop the fleet, and track startup, playing games, errors, cost and remaining daily credits.
+Run real Minecraft Java clients in separate [briq](https://briq.cloud) VMs and watch their screens together. Choose 1–50 sandboxes per launch, add to or stop the fleet, and track startup, playing games, errors, cost and remaining daily credits.
 
 Each client plays an independent built-in **demo world** with scripted keyboard movement. No Minecraft account is needed. This is a prototype, not multiplayer or an AI player.
 
@@ -57,7 +57,7 @@ Open the printed dashboard link and follow the controller's private URL. Choose 
 
 **Stop all** destroys worker VMs and disks in parallel, without saving memory snapshots, and keeps results visible on the separate controller. Runs stop automatically after 15 minutes while the controller runs; game execs also have a bounded deadline.
 
-The slider follows available capacity for the selected launch mode, up to 100 sandboxes in the active fleet, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
+The slider follows available capacity for the selected launch mode, up to 50 per launch (10 by default) and 100 in the active fleet, based on key, team, memory and disk quotas. The controller uses one live slot. Launch is disabled when credits or today's allowance are exhausted, or quota cannot be verified. Stop remains available.
 
 ## How it works
 
