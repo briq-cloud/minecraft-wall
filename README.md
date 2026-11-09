@@ -49,7 +49,7 @@ briq stop "$TEMPLATE"
 python3 deploy.py --template "$TEMPLATE"
 ```
 
-Open the printed dashboard link and follow the controller's private URL. Choose **10** sandboxes and click **Start fleet**. The first launch can take a few minutes. The counters distinguish running VMs, clients still starting/loading, and games ready to play.
+Open the printed dashboard link and follow the controller's private URL. Choose **10** sandboxes and click **Start fleet**. The first launch can take a few minutes. The Running card groups starting, loading and playing clients. Elapsed updates every second; milestone times record when the full fleet is observed started, playing and stopped. Stop timing begins at the stop request. Milestones record when the controller observes each transition, so polling and API latency affect their precision. Adding sandboxes resets the started/playing milestones for the enlarged fleet, measured from the original run start.
 
 - **Cold start** creates fresh sandboxes from the prepared template.
 - **Fork disks** creates new sandboxes from a playing worker’s disk when available, otherwise the prepared template. Forks copy files, not Java process memory: Minecraft still boots. This is not an instant live-game clone.

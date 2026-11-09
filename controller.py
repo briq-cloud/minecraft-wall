@@ -239,13 +239,16 @@ class Fleet:
                 now = self.clock()
                 run = active or {"id": uuid.uuid4().hex, "requested": 0, "startedAt": now,
                        "deadline": now + duration, "cancelled": False, "launching": False,
-                       "finishedAt": None, "workers": [], "batches": []}
+                       "finishedAt": None, "workers": [], "batches": [],
+                       "allStartedAt": None, "allPlayingAt": None,
+                       "stopRequestedAt": None, "allStoppedAt": None}
                 source = next((w["id"] for w in self.state["workers"].values()
                                if mode == "fork" and w.get("phase") == "running" and w.get("vmState") == "running"
                                and not w.get("stopRequested")), self.config["templateId"])
                 run.setdefault("pendingForkSources", []).extend([source] * (count - len(selected)))
                 run.setdefault("batches", []).append({"count": count, "mode": mode, "addedAt": now, "sourceId": source})
                 run["requested"] += count
+                run.update(allStartedAt=None, allPlayingAt=None)
                 run["workers"].extend(w["id"] for w in selected)
                 for w in selected:
                     w.update(phase="queued", baseline=w["cost"], error=None, stopSent=False, stopRequested=False)
@@ -279,6 +282,7 @@ class Fleet:
                         completed = True
                         self.launching = False
                         run["launching"] = False
+                        self.observe_milestones()
                         self.save()
                         return
                 if queued:
@@ -306,6 +310,7 @@ class Fleet:
                     self.state.pop("forkIntent", None)
                     if run.get("pendingForkSources"):
                         run["pendingForkSources"].pop(0)
+                    self.observe_milestones()
                     self.save()
                     if run["cancelled"]:
                         for b in result["briqs"]:
@@ -322,6 +327,7 @@ class Fleet:
                 with self.lock:
                     self.launching = False
                     run["launching"] = False
+                    self.observe_milestones()
                     self.save()
 
     def queue_destroy(self, worker):
@@ -331,6 +337,9 @@ class Fleet:
                 worker.update(stopRequested=False, phase="stopped")
                 worker.pop("intent", None)
                 return
+            run = self.state["run"]
+            if run and run.get("finishedAt") is None and run.get("stopRequestedAt") is None:
+                run["stopRequestedAt"] = self.clock()
             worker["stopRequested"] = True
             if not self.verified_team or worker.get("intent") == "destroy" or worker.get("destroySent"):
                 return
@@ -363,7 +372,31 @@ class Fleet:
             with self.lock:
                 worker["error"] = "Destroy outcome unknown; awaiting GET confirmation"
         finally:
-            self.save()
+            with self.lock:
+                self.observe_milestones()
+                self.save()
+
+    def observe_milestones(self):
+        """Record observed fleet transitions during lifecycle work, never a status read."""
+        run = self.state["run"]
+        if not run or run.get("finishedAt") is not None:
+            return
+        now = self.clock()
+        selected = [self.state["workers"][identity] for identity in run["workers"]]
+        complete = run["requested"] > 0 and len(selected) == run["requested"]
+        # Legacy runs have no startup observations; do not invent their past timings.
+        track_startup = "allStartedAt" in run and "allPlayingAt" in run
+        if track_startup and complete and not run["cancelled"] and run.get("stopRequestedAt") is None:
+            if all(w.get("vmState") == "running" for w in selected):
+                if run.get("allStartedAt") is None:
+                    run["allStartedAt"] = now
+                if all(w["phase"] == "running" and not w.get("stopRequested") for w in selected):
+                    if run.get("allPlayingAt") is None:
+                        run["allPlayingAt"] = now
+        if (run.get("stopRequestedAt") is not None and run.get("allStoppedAt") is None
+                and not run["launching"] and not self.state.get("forkIntent")
+                and all(w.get("vmState") == "destroyed" for w in selected)):
+            run["allStoppedAt"] = now
 
     def stop(self):
         with self.lock:
@@ -371,8 +404,11 @@ class Fleet:
             run = self.state["run"]
             if run:
                 run["cancelled"] = True
+                if run.get("finishedAt") is None and run.get("stopRequestedAt") is None:
+                    run["stopRequestedAt"] = self.clock()
             for w in self.state["workers"].values():
                 self.queue_destroy(w)
+            self.observe_milestones()
             self.save()
 
     def tick(self):
@@ -469,6 +505,7 @@ class Fleet:
                         if run:
                             run["cancelled"] = True
         with self.lock:
+            self.observe_milestones()
             if run and not self.preflighting and not run["launching"] and not self.state.get("forkIntent") and not any(w.get("intent") for w in self.state["workers"].values() if w.get("vmState") != "destroyed") and all(self.state["workers"][i].get("vmState") in TERMINAL_VM for i in run["workers"]) and not any(w.get("stopRequested") for w in self.state["workers"].values()):
                 run["finishedAt"] = run["finishedAt"] or self.clock()
             self.save()
@@ -476,6 +513,7 @@ class Fleet:
     def snapshot(self):
         with self.lock:
             result = copy.deepcopy(self.state)
+            result["observedAt"] = self.clock()
         quota = result["quota"]
         fetched = quota.get("fetchedAt")
         quota["ageSeconds"] = max(0, self.clock() - fetched) if fetched is not None else None
@@ -490,13 +528,24 @@ class Fleet:
                              capacity=reserved + additional, allowedConcurrency=reserved + additional)
         run = result["run"]
         selected = [result["workers"][i] for i in run["workers"]] if run else []
-        result["summary"] = {"running": sum(w["phase"] == "running" and w.get("vmState") == "running" and not w.get("stopRequested") for w in selected),
-                             "preparing": (max(0, run["requested"] - len(selected)) if run and not run["cancelled"] else 0) + sum(
-                                 w["phase"] in {"queued", "starting", "preparing"} and not w.get("stopRequested")
-                                 and not (run and run["cancelled"]) for w in selected),
+        starting = (max(0, run["requested"] - len(selected)) if run and not run["cancelled"] else 0) + sum(
+            w["phase"] in {"queued", "starting"} and not w.get("stopRequested")
+            and not (run and run["cancelled"]) for w in selected)
+        loading = sum(w["phase"] == "preparing" and not w.get("stopRequested")
+                      and not (run and run["cancelled"]) for w in selected)
+        milestones = {}
+        for name, observed, origin in (("allStartedSeconds", "allStartedAt", "startedAt"),
+                                       ("allPlayingSeconds", "allPlayingAt", "startedAt"),
+                                       ("allStoppedSeconds", "allStoppedAt", "stopRequestedAt")):
+            milestones[name] = (round(max(0, run[observed] - run[origin]), 3)
+                                if run and run.get(observed) is not None and run.get(origin) is not None else None)
+        result["summary"] = {"starting": starting, "loading": loading, "milestones": milestones,
+                             "running": sum(w["phase"] == "running" and w.get("vmState") == "running" and not w.get("stopRequested") for w in selected),
+                             "preparing": starting + loading,
                              "vmRunning": sum(w.get("vmState") == "running" for w in selected),
                              "started": sum(bool(w.get("execId")) for w in selected),
                              "finished": sum(w.get("gameResult") == "finished" for w in selected),
+                             "stopped": sum(w.get("vmState") == "destroyed" for w in selected),
                              "errors": sum(w["phase"] == "error" or w.get("gameResult") == "error" or bool(w.get("error")) for w in selected),
                              "costCents": sum(max(0, w.get("cost", 0) - w.get("baseline", 0)) for w in selected),
                              "elapsed": max(0, int((run["finishedAt"] or self.clock()) - run["startedAt"])) if run else 0}

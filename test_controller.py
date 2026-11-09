@@ -593,6 +593,144 @@ class FleetTests(unittest.TestCase):
         self.start_sync()
         self.assertIsNone(self.fleet.state['run']['finishedAt'])
 
+    def test_milestones_observed_by_monitor_and_persisted_once(self):
+        self.start_sync()
+        self.fleet.clock = lambda: 1006.25
+        self.assertIsNone(self.fleet.snapshot()['summary']['milestones']['allStartedSeconds'])
+        with patch('controller.build_opener') as opener:
+            response = opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = json.dumps({'gameLoaded': False, 'javaAlive': True, 'frameAgeSeconds': 1}).encode()
+            self.fleet.tick()
+            summary = self.fleet.snapshot()['summary']
+            self.assertEqual(summary['starting'], 0)
+            self.assertEqual(summary['loading'], 1)
+            self.assertEqual(summary['running'], 0)
+            self.assertEqual(summary['milestones']['allStartedSeconds'], 6.25)
+            self.assertIsNone(summary['milestones']['allPlayingSeconds'])
+            self.fleet.clock = lambda: 1012.5
+            response.read.return_value = json.dumps({'gameLoaded': True, 'javaAlive': True, 'frameAgeSeconds': 1}).encode()
+            self.fleet.tick()
+            self.fleet.clock = lambda: 1015.5
+            self.fleet.tick()
+        snapshot = self.fleet.snapshot()
+        self.assertEqual(snapshot['observedAt'], 1015.5)
+        self.assertEqual(snapshot['summary']['milestones'], {'allStartedSeconds': 6.25, 'allPlayingSeconds': 12.5, 'allStoppedSeconds': None})
+        self.assertEqual(snapshot['summary']['loading'], 0)
+        self.assertEqual(snapshot['summary']['running'], 1)
+        saved = json.loads(self.path.read_text())['run']
+        self.assertEqual(saved['allStartedAt'], 1006.25)
+        self.assertEqual(saved['allPlayingAt'], 1012.5)
+
+    def test_add_resets_fleet_milestones_using_original_start(self):
+        self.start_sync()
+        with patch('controller.build_opener') as opener:
+            response = opener.return_value.open.return_value.__enter__.return_value
+            response.read.return_value = json.dumps({'gameLoaded': True, 'javaAlive': True, 'frameAgeSeconds': 1}).encode()
+            self.fleet.clock = lambda: 1003
+            self.fleet.tick()
+            self.assertEqual(self.fleet.state['run']['allPlayingAt'], 1003)
+            self.fleet.clock = lambda: 1010
+            with patch('controller.threading.Thread'):
+                self.fleet.start(1, add=True)
+            summary = self.fleet.snapshot()['summary']
+            self.assertEqual(summary['starting'], 1)
+            self.assertEqual(summary['running'], 1)
+            self.assertIsNone(summary['milestones']['allStartedSeconds'])
+            self.assertIsNone(summary['milestones']['allPlayingSeconds'])
+            self.fleet.launch(self.fleet.state['run'])
+            for identity in self.fleet.state['run']['workers']:
+                self.api.rows[identity]['state'] = 'running'
+            self.fleet.clock = lambda: 1021
+            self.fleet.tick()
+        self.assertEqual(self.fleet.snapshot()['summary']['milestones'], {'allStartedSeconds': 21, 'allPlayingSeconds': 21, 'allStoppedSeconds': None})
+        self.assertIsNone(self.fleet.state['run']['stopRequestedAt'])
+
+    def test_partial_receipts_and_cancelled_run_never_reach_all_playing(self):
+        with patch('controller.threading.Thread'):
+            self.fleet.start(2)
+        run = self.fleet.state['run']
+        self.fleet.state['workers']['bq_worker'].update(vmState='running', phase='running')
+        run['workers'].append('bq_worker')
+        with self.fleet.lock:
+            self.fleet.observe_milestones()
+        self.assertIsNone(run['allStartedAt'])
+        self.assertIsNone(run['allPlayingAt'])
+        run.update(requested=1, cancelled=True)
+        with self.fleet.lock:
+            self.fleet.observe_milestones()
+        self.assertIsNone(run['allPlayingAt'])
+        self.assertEqual(self.fleet.snapshot()['summary']['starting'], 0)
+
+    def test_stop_milestone_times_confirmed_destruction_from_first_request(self):
+        self.start_sync()
+        original = self.api.call
+        def async_delete(method, path, body=None):
+            if method == 'DELETE':
+                return {'briq': {'state': 'destroying'}}
+            return original(method, path, body)
+        self.api.call = async_delete
+        self.fleet.clock = lambda: 1010.25
+        self.fleet.stop()
+        self.drain()
+        self.fleet.clock = lambda: 1014
+        self.fleet.stop()
+        self.assertEqual(self.fleet.state['run']['stopRequestedAt'], 1010.25)
+        self.assertIsNone(self.fleet.snapshot()['summary']['milestones']['allStoppedSeconds'])
+        for row in self.api.rows.values():
+            row['state'] = 'destroyed'
+        self.fleet.clock = lambda: 1017.75
+        self.fleet.tick()
+        snapshot = self.fleet.snapshot()
+        self.assertEqual(snapshot['summary']['milestones']['allStoppedSeconds'], 7.5)
+        self.assertEqual(snapshot['summary']['stopped'], 1)
+        self.assertEqual(json.loads(self.path.read_text())['run']['allStoppedAt'], 1017.75)
+        self.fleet.clock = lambda: 1030
+        self.fleet.tick()
+        self.assertEqual(self.fleet.snapshot()['summary']['milestones']['allStoppedSeconds'], 7.5)
+
+    def test_natural_completion_milestone_ignores_unselected_workers(self):
+        self.start_sync()
+        self.fleet.tick()
+        self.api.exec.update(state='exited', exitCode=0)
+        self.fleet.clock = lambda: 1010
+        self.fleet.tick()
+        self.drain()
+        self.fleet.clock = lambda: 1013
+        self.fleet.tick()
+        self.assertEqual(self.fleet.state['workers']['bq_worker']['vmState'], 'running')
+        self.assertIsNotNone(self.fleet.state['run']['finishedAt'])
+        self.assertIsNotNone(self.fleet.snapshot()['summary']['milestones']['allStoppedSeconds'])
+
+    def test_live_legacy_run_does_not_invent_startup_timings(self):
+        self.start_sync()
+        run = self.fleet.state['run']
+        run.pop('allStartedAt')
+        run.pop('allPlayingAt')
+        self.fleet.state['workers']['bq_fork'].update(vmState='running', phase='running')
+        self.fleet.clock = lambda: 1100
+        with self.fleet.lock:
+            self.fleet.observe_milestones()
+        metrics = self.fleet.snapshot()['summary']['milestones']
+        self.assertIsNone(metrics['allStartedSeconds'])
+        self.assertIsNone(metrics['allPlayingSeconds'])
+        self.fleet.stop()
+        self.drain()
+        self.assertIsNotNone(self.fleet.snapshot()['summary']['milestones']['allStoppedSeconds'])
+
+    def test_finished_history_without_observations_keeps_unknown_milestones(self):
+        self.start_sync()
+        run = self.fleet.state['run']
+        run['finishedAt'] = 1043
+        for key in ('allStartedAt', 'allPlayingAt', 'stopRequestedAt', 'allStoppedAt'):
+            run.pop(key)
+        for identity, worker in self.fleet.state['workers'].items():
+            worker.update(vmState='destroyed', phase='stopped')
+            self.api.rows[identity]['state'] = 'destroyed'
+        self.fleet.clock = lambda: 1050
+        self.fleet.tick()
+        self.assertEqual(self.fleet.snapshot()['summary']['milestones'], {'allStartedSeconds': None, 'allPlayingSeconds': None, 'allStoppedSeconds': None})
+        self.assertNotIn('allStoppedAt', run)
+
     def test_stale_frames_are_not_counted_running(self):
         self.start_sync()
         self.fleet.tick()
