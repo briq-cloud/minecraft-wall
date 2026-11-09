@@ -22,6 +22,8 @@ assert.doesNotMatch(html, / · balance |Start fresh sandboxes|rateNote|USD rate 
 assert.match(html, /class="button" href="https:\/\/github.com/);
 assert.match(html, /Powered by briq/);
 assert.match(html, /Cloud sandboxes for your agents/);
+assert.match(html,/repeat\(auto-fill,minmax\(0,min\(100%,var\(--tile-min\)\)\)\)/,'screen columns are capped at the selected size');
+assert.doesNotMatch(html,/auto-fit|var\(--tile-min\)\),1fr/,'sparse grids cannot stretch a screen across the wall');
 vm.runInContext(html.split('<script>')[1].split('</script>')[0],context);
 (async()=>{
   assert.equal(node('main').dataset.size,'m','medium is the default');
